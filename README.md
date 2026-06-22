@@ -47,11 +47,11 @@ telephone numbers, addresses, recurrence, survival, and follow-up treatment.
 The WES workbooks remain separate long-form molecular data and are not passed
 directly into the clinical MLP.
 
-The source export labels `T分期`, `N分期`, `M分期`, and `分期` in a combined
-pathology/clinical sheet. The adapter maps them to postoperative pathological
-fields, but this interpretation must be confirmed against the current data
-dictionary. The legacy CEA unit is also unusual and must be verified before
-combining centers or time periods.
+The source export stores T category, N category, M category, and overall stage
+in a combined pathology/clinical sheet. The adapter maps them to postoperative
+pathological fields, but this interpretation must be confirmed against the
+current data dictionary. The legacy CEA unit is also unusual and must be
+verified before combining centers or time periods.
 
 The full linked-table contract is documented in
 [`docs/dataset_contract.md`](docs/dataset_contract.md).
