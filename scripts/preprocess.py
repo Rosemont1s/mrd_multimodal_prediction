@@ -14,6 +14,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from src.data.manifest import create_split_manifest
+from src.data.ct_manifest import load_ct_path_map
 from src.data.transforms import get_val_transforms
 from src.utils.config import load_config
 
@@ -38,17 +39,28 @@ def cache_ct_data(cfg: dict, patient_ids: list[str]) -> None:
     keys = [f"image_{index}" for index in range(len(sequences))]
     transform = get_val_transforms(cfg["ct_preprocessing"], keys)
     raw_dir = Path(data_cfg["raw_dir"])
+    path_map = (
+        load_ct_path_map(data_cfg, patient_ids)
+        if data_cfg.get("use_ct_manifest", True)
+        else None
+    )
     cache_dir = Path(data_cfg.get("cache_dir", "data/processed/ct_cache"))
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     for patient_id in tqdm(patient_ids, desc="Caching deterministic CT"):
         sample = {}
         for key, sequence in zip(keys, sequences):
-            candidates = [
-                raw_dir / patient_id / f"{sequence}.nii.gz",
-                raw_dir / patient_id / f"{sequence}.nii",
-            ]
-            path = next((candidate for candidate in candidates if candidate.exists()), None)
+            if path_map is not None:
+                path = path_map[patient_id][sequence]
+            else:
+                candidates = [
+                    raw_dir / patient_id / f"{sequence}.nii.gz",
+                    raw_dir / patient_id / f"{sequence}.nii",
+                ]
+                path = next(
+                    (candidate for candidate in candidates if candidate.exists()),
+                    None,
+                )
             if path is None:
                 raise FileNotFoundError(
                     f"Missing CT sequence {sequence} for patient {patient_id}"

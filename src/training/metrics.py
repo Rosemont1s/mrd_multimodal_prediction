@@ -13,6 +13,7 @@ import numpy as np
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
+    brier_score_loss,
     confusion_matrix,
     f1_score,
     roc_curve,
@@ -32,14 +33,27 @@ class MetricComputer:
     Args:
         metrics_list: List of metric names to compute.  Supported:
             ``"auroc"``, ``"auprc"``, ``"accuracy"``, ``"sensitivity"``,
-            ``"specificity"``, ``"f1"``.
+            ``"specificity"``, ``"ppv"``, ``"npv"``, ``"f1"``,
+            ``"test_rate"``, ``"tests_avoided_rate"``, and
+            ``"mrd_positive_miss_rate"``.
         threshold: Decision threshold for converting probabilities to
             binary predictions (used for accuracy, sensitivity, specificity,
             F1).
     """
 
     SUPPORTED_METRICS = {
-        "auroc", "auprc", "accuracy", "sensitivity", "specificity", "f1"
+        "auroc",
+        "auprc",
+        "accuracy",
+        "sensitivity",
+        "specificity",
+        "ppv",
+        "npv",
+        "f1",
+        "test_rate",
+        "tests_avoided_rate",
+        "mrd_positive_miss_rate",
+        "brier_score",
     }
 
     def __init__(
@@ -106,6 +120,12 @@ class MetricComputer:
         # Binary predictions
         preds = (probs >= self.threshold).astype(np.int32)
         targets_int = targets.astype(np.int32)
+        tn, fp, fn, tp = confusion_matrix(
+            targets_int, preds, labels=[0, 1]
+        ).ravel()
+        total = tn + fp + fn + tp
+        predicted_positive = tp + fp
+        predicted_negative = tn + fn
 
         results: Dict[str, float] = {}
 
@@ -120,9 +140,33 @@ class MetricComputer:
                 results["sensitivity"] = self._sensitivity(targets_int, preds)
             elif metric == "specificity":
                 results["specificity"] = self._specificity(targets_int, preds)
+            elif metric == "ppv":
+                results["ppv"] = (
+                    float(tp / predicted_positive) if predicted_positive else 0.0
+                )
+            elif metric == "npv":
+                results["npv"] = (
+                    float(tn / predicted_negative) if predicted_negative else 0.0
+                )
             elif metric == "f1":
                 results["f1"] = float(
                     f1_score(targets_int, preds, zero_division=0)
+                )
+            elif metric == "test_rate":
+                results["test_rate"] = (
+                    float(predicted_positive / total) if total else 0.0
+                )
+            elif metric == "tests_avoided_rate":
+                results["tests_avoided_rate"] = (
+                    float(predicted_negative / total) if total else 0.0
+                )
+            elif metric == "mrd_positive_miss_rate":
+                results["mrd_positive_miss_rate"] = (
+                    float(fn / (tp + fn)) if tp + fn else 0.0
+                )
+            elif metric == "brier_score":
+                results["brier_score"] = float(
+                    brier_score_loss(targets_int, probs)
                 )
 
         return results
@@ -203,19 +247,41 @@ class MetricComputer:
 
 
 def select_operating_threshold(
-    targets: np.ndarray, probabilities: np.ndarray, strategy: str = "youden"
+    targets: np.ndarray,
+    probabilities: np.ndarray,
+    strategy: str = "youden",
+    target_sensitivity: float = 0.95,
 ) -> float:
     """Select one threshold from pooled out-of-fold predictions."""
     targets = np.asarray(targets).astype(int)
     probabilities = np.asarray(probabilities, dtype=float)
     if len(np.unique(targets)) < 2:
         raise ValueError("Threshold selection requires both outcome classes.")
-    if strategy != "youden":
-        raise ValueError("Only the 'youden' threshold strategy is supported.")
-    fpr, tpr, thresholds = roc_curve(targets, probabilities)
+    if strategy not in {"youden", "target_sensitivity"}:
+        raise ValueError(
+            "threshold strategy must be 'youden' or 'target_sensitivity'."
+        )
+    fpr, tpr, thresholds = roc_curve(
+        targets, probabilities, drop_intermediate=False
+    )
     finite = np.isfinite(thresholds)
-    index = int(np.argmax((tpr - fpr)[finite]))
-    return float(np.clip(thresholds[finite][index], 0.0, 1.0))
+    finite_fpr = fpr[finite]
+    finite_tpr = tpr[finite]
+    finite_thresholds = thresholds[finite]
+    if strategy == "youden":
+        index = int(np.argmax(finite_tpr - finite_fpr))
+    else:
+        if not 0.0 < target_sensitivity <= 1.0:
+            raise ValueError("target_sensitivity must be in (0, 1].")
+        eligible = np.flatnonzero(finite_tpr >= target_sensitivity)
+        if len(eligible) == 0:
+            raise ValueError(
+                "No finite threshold achieves the requested target sensitivity."
+            )
+        # The highest eligible threshold minimizes testing while preserving the
+        # prespecified sensitivity on derivation data.
+        index = int(eligible[np.argmax(finite_thresholds[eligible])])
+    return float(np.clip(finite_thresholds[index], 0.0, 1.0))
 
 
 def metrics_from_probabilities(
@@ -226,13 +292,22 @@ def metrics_from_probabilities(
     probabilities = np.asarray(probabilities, dtype=float)
     predictions = (probabilities >= threshold).astype(int)
     tn, fp, fn, tp = confusion_matrix(targets, predictions, labels=[0, 1]).ravel()
+    total = tn + fp + fn + tp
+    predicted_positive = tp + fp
+    predicted_negative = tn + fn
     return {
         "auroc": MetricComputer._safe_auroc(targets, probabilities),
         "auprc": MetricComputer._safe_auprc(targets, probabilities),
         "accuracy": float(accuracy_score(targets, predictions)),
         "sensitivity": float(tp / (tp + fn)) if tp + fn else 0.0,
         "specificity": float(tn / (tn + fp)) if tn + fp else 0.0,
+        "ppv": float(tp / predicted_positive) if predicted_positive else 0.0,
+        "npv": float(tn / predicted_negative) if predicted_negative else 0.0,
         "f1": float(f1_score(targets, predictions, zero_division=0)),
+        "test_rate": float(predicted_positive / total) if total else 0.0,
+        "tests_avoided_rate": float(predicted_negative / total) if total else 0.0,
+        "mrd_positive_miss_rate": float(fn / (tp + fn)) if tp + fn else 0.0,
+        "brier_score": float(brier_score_loss(targets, probabilities)),
         "tn": int(tn),
         "fp": int(fp),
         "fn": int(fn),
@@ -257,7 +332,21 @@ def bootstrap_confidence_intervals(
         raise ValueError("Bootstrap confidence intervals require both classes.")
 
     samples: Dict[str, List[float]] = {
-        key: [] for key in ("auroc", "auprc", "accuracy", "sensitivity", "specificity", "f1")
+        key: []
+        for key in (
+            "auroc",
+            "auprc",
+            "accuracy",
+            "sensitivity",
+            "specificity",
+            "ppv",
+            "npv",
+            "f1",
+            "test_rate",
+            "tests_avoided_rate",
+            "mrd_positive_miss_rate",
+            "brier_score",
+        )
     }
     for _ in range(n_bootstrap):
         selected = np.concatenate(
@@ -277,3 +366,63 @@ def bootstrap_confidence_intervals(
         }
         for key, values in samples.items()
     }
+
+
+def calibration_curve_data(
+    targets: np.ndarray,
+    probabilities: np.ndarray,
+    n_bins: int = 10,
+) -> List[Dict[str, float]]:
+    """Return equal-width calibration bins without fitting on evaluation data."""
+    targets = np.asarray(targets).astype(int)
+    probabilities = np.asarray(probabilities, dtype=float)
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_ids = np.minimum(np.digitize(probabilities, edges[1:-1]), n_bins - 1)
+    rows: List[Dict[str, float]] = []
+    for bin_id in range(n_bins):
+        selected = bin_ids == bin_id
+        if not selected.any():
+            continue
+        rows.append(
+            {
+                "bin_lower": float(edges[bin_id]),
+                "bin_upper": float(edges[bin_id + 1]),
+                "mean_predicted_probability": float(
+                    probabilities[selected].mean()
+                ),
+                "observed_mrd_rate": float(targets[selected].mean()),
+                "patients": int(selected.sum()),
+            }
+        )
+    return rows
+
+
+def decision_curve_data(
+    targets: np.ndarray,
+    probabilities: np.ndarray,
+    thresholds: np.ndarray | None = None,
+) -> List[Dict[str, float]]:
+    """Compute model, test-all, and test-none net benefit curves."""
+    targets = np.asarray(targets).astype(int)
+    probabilities = np.asarray(probabilities, dtype=float)
+    if thresholds is None:
+        thresholds = np.linspace(0.01, 0.99, 99)
+    prevalence = float(targets.mean())
+    total = len(targets)
+    rows: List[Dict[str, float]] = []
+    for threshold in thresholds:
+        predictions = probabilities >= threshold
+        tp = int(np.sum(predictions & (targets == 1)))
+        fp = int(np.sum(predictions & (targets == 0)))
+        odds = float(threshold / (1.0 - threshold))
+        rows.append(
+            {
+                "threshold": float(threshold),
+                "model_net_benefit": float((tp / total) - (fp / total) * odds),
+                "test_all_net_benefit": float(
+                    prevalence - (1.0 - prevalence) * odds
+                ),
+                "test_none_net_benefit": 0.0,
+            }
+        )
+    return rows

@@ -4,9 +4,107 @@ data:
   processed_dir: data/processed
   clinical_csv: data/raw/clinical_data.csv
   manifest_path: data/processed/splits.csv
+  readiness_report: data/processed/readiness_report.json
+  audit_issues: data/processed/audit_issues.csv
+  require_readiness_report: true
+  cohort_tables:
+    cohort: data/raw/tables/cohort.csv
+    preoperative: data/raw/tables/preoperative.csv
+    pathology: data/raw/tables/pathology.csv
+    mrd: data/raw/tables/mrd.csv
+    ct_manifest: data/raw/tables/ct_manifest.csv
+    longitudinal_ctdna: data/raw/tables/longitudinal_ctdna.csv
+    wes: data/raw/tables/wes.csv
+    follow_up: data/raw/tables/follow_up.csv
+  mrd_endpoint:
+    assay_definition_finalized: false
+    blood_draw_window_finalized: false
+    blood_draw_min_days: null
+    blood_draw_max_days: null
+  expected_lab_units:
+    cea: ng/mL
+    ca199: U/mL
   patient_id_column: patient_id
   label_column: mrd_status
+  # Only variables available before the decision to order the MRD assay.
+  # Rename these entries to exactly match the clinical CSV headers.
+  clinical_feature_columns:
+    - age
+    - sex
+    - ecog
+    - cea_preoperative
+    - ca199_preoperative
+    - clinical_t
+    - clinical_n
+    - clinical_m
+    - pathological_t
+    - pathological_n
+    - pathological_m
+    - pathological_stage
+    - tumor_location
+    - tumor_side
+    - tumor_size_pathological_mm
+    - histological_type
+    - histological_grade
+    - lymphovascular_invasion
+    - perineural_invasion
+    - tumor_deposits
+    - bowel_obstruction
+    - tumor_perforation
+    - resection_margin
+    - examined_lymph_nodes
+    - positive_lymph_nodes
+    - surgery_procedure
+    - her2_status
+    - braf_status
+    - ki67_percent
+  active_clinical_profile: clinical_pathology
+  clinical_feature_profiles:
+    stage_only:
+      - pathological_stage
+    clinical_pathology:
+      - age
+      - sex
+      - ecog
+      - cea_preoperative
+      - ca199_preoperative
+      - clinical_t
+      - clinical_n
+      - clinical_m
+      - pathological_t
+      - pathological_n
+      - pathological_m
+      - pathological_stage
+      - tumor_location
+      - tumor_side
+      - tumor_size_pathological_mm
+      - histological_type
+      - histological_grade
+      - lymphovascular_invasion
+      - perineural_invasion
+      - tumor_deposits
+      - bowel_obstruction
+      - tumor_perforation
+      - resection_margin
+      - examined_lymph_nodes
+      - positive_lymph_nodes
+      - surgery_procedure
+      - her2_status
+      - braf_status
+      - ki67_percent
+  # Explicitly deny variables measured after, or determined by, the MRD result.
+  forbidden_clinical_columns:
+    - mrd_test_date
+    - adjuvant_treatment_after_mrd
+    - recurrence
+    - recurrence_date
+    - disease_free_survival
+    - overall_survival
+    - later_ctdna_result
+    - ctdna_trajectory
   ct_sequences: [sequence_1, sequence_2, sequence_3, sequence_4]
+  ct_phases_confirmed: false
+  use_ct_manifest: true
   num_workers: 4
   pin_memory: true
   use_cache: false
@@ -14,6 +112,10 @@ data:
   random_seed: 42
   cross_validation:
     n_splits: 5
+    strategy: temporal_cohort
+    cohort_column: cohort_period
+    development_value: retrospective
+    test_value: prospective
     test_size: 0.15
 
 ct_preprocessing:
@@ -73,11 +175,14 @@ training:
   grad_clip_max_norm: 1.0
 
 evaluation:
-  metrics: [auroc, auprc, accuracy, sensitivity, specificity, f1]
+  metrics: [auroc, auprc, sensitivity, specificity, ppv, npv, tests_avoided_rate, brier_score]
   threshold: 0.5
-  threshold_strategy: youden
+  threshold_strategy: target_sensitivity
+  target_sensitivity: 0.95
   bootstrap_samples: 1000
   confidence_level: 0.95
+  calibration_bins: 10
+  subgroups: [pathological_stage, tumor_side, sex, cohort_period]
 
 logging:
   backend: tensorboard

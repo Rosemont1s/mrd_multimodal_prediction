@@ -42,6 +42,12 @@ class ClinicalProcessor:
         ``"patient_id"``).
     label_col : str
         Column name for the binary MRD label (expected values: 0 or 1).
+    feature_columns : sequence of str, optional
+        Explicit allowlist of predictors available at the MRD-testing decision
+        point. If omitted, all non-label columns are used with a warning.
+    forbidden_feature_columns : sequence of str, optional
+        Columns that must never be admitted as predictors, such as recurrence
+        or treatment decisions made after the MRD result.
 
     Attributes
     ----------
@@ -71,10 +77,35 @@ class ClinicalProcessor:
         csv_path: Union[str, Path],
         patient_id_col: str = "patient_id",
         label_col: str = "mrd_label",
+        feature_columns: Optional[Sequence[str]] = None,
+        forbidden_feature_columns: Optional[Sequence[str]] = None,
     ) -> None:
         self.csv_path = Path(csv_path)
         self.patient_id_col = patient_id_col
         self.label_col = label_col
+        self.feature_columns = (
+            list(dict.fromkeys(feature_columns))
+            if feature_columns is not None
+            else None
+        )
+        self.forbidden_feature_columns = set(forbidden_feature_columns or [])
+
+        if self.feature_columns is not None:
+            protected = {self.patient_id_col, self.label_col}
+            invalid = sorted(protected.intersection(self.feature_columns))
+            if invalid:
+                raise ValueError(
+                    "Clinical feature columns cannot include protected columns: "
+                    f"{invalid}"
+                )
+            forbidden = sorted(
+                self.forbidden_feature_columns.intersection(self.feature_columns)
+            )
+            if forbidden:
+                raise ValueError(
+                    "Clinical feature allowlist includes forbidden post-decision "
+                    f"columns: {forbidden}"
+                )
 
         # Load CSV and index by patient ID
         self.df: pd.DataFrame = pd.read_csv(self.csv_path)
@@ -88,6 +119,15 @@ class ClinicalProcessor:
                 f"Label column '{self.label_col}' not found in "
                 f"{self.csv_path}.  Available columns: {list(self.df.columns)}"
             )
+        if self.feature_columns is not None:
+            missing_features = sorted(
+                set(self.feature_columns) - set(self.df.columns)
+            )
+            if missing_features:
+                raise ValueError(
+                    "Configured clinical feature columns are missing from "
+                    f"{self.csv_path}: {missing_features}"
+                )
         if self.df[self.patient_id_col].astype(str).duplicated().any():
             raise ValueError("Clinical CSV contains duplicate patient IDs.")
 
@@ -123,7 +163,16 @@ class ClinicalProcessor:
         df_subset : pd.DataFrame
             Subset of the full DataFrame (training patients only).
         """
-        feature_cols = [c for c in df_subset.columns if c not in self._exclude_cols]
+        if self.feature_columns is None:
+            feature_cols = [
+                c for c in df_subset.columns if c not in self._exclude_cols
+            ]
+            logger.warning(
+                "No clinical feature allowlist configured; using every non-label "
+                "column. Set data.clinical_feature_columns to prevent leakage."
+            )
+        else:
+            feature_cols = self.feature_columns
         self.numeric_cols = [
             c for c in feature_cols if pd.api.types.is_numeric_dtype(df_subset[c])
         ]
@@ -259,8 +308,11 @@ class ClinicalProcessor:
 
         # Numeric features
         if self.numeric_cols and self._scaler is not None:
+            numeric_row = pd.to_numeric(
+                row[self.numeric_cols], errors="coerce"
+            )
             numeric_vals = (
-                row[self.numeric_cols]
+                numeric_row
                 .fillna(self._numeric_fill_values)
                 .values.astype(np.float64)
                 .reshape(1, -1)
@@ -386,6 +438,8 @@ class ClinicalProcessor:
             "csv_path": str(self.csv_path),
             "patient_id_col": self.patient_id_col,
             "label_col": self.label_col,
+            "feature_columns": self.feature_columns,
+            "forbidden_feature_columns": sorted(self.forbidden_feature_columns),
             "numeric_cols": self.numeric_cols,
             "categorical_cols": self.categorical_cols,
             "scaler": self._scaler,
@@ -425,6 +479,8 @@ class ClinicalProcessor:
             csv_path=state["csv_path"],
             patient_id_col=state["patient_id_col"],
             label_col=state["label_col"],
+            feature_columns=state.get("feature_columns"),
+            forbidden_feature_columns=state.get("forbidden_feature_columns"),
         )
         instance.numeric_cols = state["numeric_cols"]
         instance.categorical_cols = state["categorical_cols"]

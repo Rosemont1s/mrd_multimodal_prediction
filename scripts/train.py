@@ -91,6 +91,11 @@ def parse_args() -> argparse.Namespace:
         choices=["gated_fusion", "clinical_only", "ct_only"],
         default=None,
     )
+    parser.add_argument(
+        "--clinical-profile",
+        default=None,
+        help="Named data.clinical_feature_profiles entry.",
+    )
     parser.add_argument("--resume", default=None)
     parser.add_argument("--output-dir", default="experiments")
     parser.add_argument("--override", nargs="*", default=None)
@@ -101,12 +106,18 @@ def train_fold(base_cfg: dict, fold: int, args: argparse.Namespace) -> dict:
     cfg = copy.deepcopy(base_cfg)
     if args.variant:
         cfg["model"]["variant"] = args.variant
+    if args.clinical_profile:
+        cfg["data"]["active_clinical_profile"] = args.clinical_profile
     validate_config(cfg)
     seed = int(cfg["data"].get("random_seed", 42)) + fold
     set_seed(seed)
 
     variant = cfg["model"]["variant"]
-    output_dir = Path(args.output_dir) / variant / f"fold_{fold}"
+    profile = cfg["data"].get("active_clinical_profile", "default")
+    experiment_name = (
+        variant if variant == "ct_only" else f"{variant}_{profile}"
+    )
+    output_dir = Path(args.output_dir) / experiment_name / f"fold_{fold}"
     output_dir.mkdir(parents=True, exist_ok=True)
     cfg["logging"]["log_dir"] = str(output_dir / "logs")
     save_config(cfg, str(output_dir / "effective_config.yaml"))

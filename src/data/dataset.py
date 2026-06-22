@@ -12,10 +12,23 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from src.data.clinical_processor import ClinicalProcessor
+from src.data.ct_manifest import load_ct_path_map
 from src.data.manifest import load_split_manifest
 from src.data.transforms import get_train_transforms, get_val_transforms
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_clinical_feature_columns(data_cfg: Dict[str, Any]) -> List[str] | None:
+    """Resolve the active baseline profile to an explicit feature allowlist."""
+    profile = data_cfg.get("active_clinical_profile")
+    profiles = data_cfg.get("clinical_feature_profiles", {})
+    if profile:
+        if profile not in profiles:
+            raise ValueError(f"Unknown clinical feature profile: {profile}")
+        return list(profiles[profile])
+    configured = data_cfg.get("clinical_feature_columns")
+    return list(configured) if configured is not None else None
 
 
 def _find_ct_path(patient_dir: Path, sequence: str) -> Path:
@@ -59,6 +72,12 @@ class MRDMultimodalDataset(Dataset):
         data_cfg = cfg["data"]
         self.raw_dir = Path(data_cfg["raw_dir"])
         self.sequences = list(data_cfg["ct_sequences"])
+        self.ct_path_map = (
+            load_ct_path_map(data_cfg, self.patient_ids)
+            if data_cfg.get("use_ct_manifest", True)
+            and self.variant != "clinical_only"
+            else None
+        )
         self.use_cache = bool(data_cfg.get("use_cache", False))
         self.cache_dir = Path(data_cfg.get("cache_dir", "data/processed/ct_cache"))
         self.keys = [f"image_{index}" for index in range(len(self.sequences))]
@@ -83,11 +102,17 @@ class MRDMultimodalDataset(Dataset):
             ct = torch.load(cache_path, map_location="cpu", weights_only=True).float()
             return _augment_cached_ct(ct) if self.training else ct
 
-        patient_dir = self.raw_dir / patient_id
-        sample = {
-            key: str(_find_ct_path(patient_dir, sequence))
-            for key, sequence in zip(self.keys, self.sequences)
-        }
+        if self.ct_path_map is not None:
+            sample = {
+                key: str(self.ct_path_map[patient_id][sequence])
+                for key, sequence in zip(self.keys, self.sequences)
+            }
+        else:
+            patient_dir = self.raw_dir / patient_id
+            sample = {
+                key: str(_find_ct_path(patient_dir, sequence))
+                for key, sequence in zip(self.keys, self.sequences)
+            }
         transformed = self.transform(sample)
         volumes = [torch.as_tensor(transformed[key]).float() for key in self.keys]
         return torch.cat(volumes, dim=0)
@@ -157,6 +182,8 @@ def build_data_bundle(
         data_cfg["clinical_csv"],
         data_cfg["patient_id_column"],
         data_cfg["label_column"],
+        feature_columns=resolve_clinical_feature_columns(data_cfg),
+        forbidden_feature_columns=data_cfg.get("forbidden_clinical_columns"),
     ).fit(train_rows["patient_id"].tolist())
 
     datasets = {

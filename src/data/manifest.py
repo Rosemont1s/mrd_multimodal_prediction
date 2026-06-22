@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -10,6 +11,8 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
+
+from src.data.ct_manifest import load_ct_path_map
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +30,22 @@ def validate_patient_files(
     raw_dir: str | Path,
     sequences: List[str],
     check_geometry: bool = True,
+    path_map: Dict[str, Dict[str, Path]] | None = None,
 ) -> None:
     """Validate CT completeness and registered geometry for every patient."""
     raw_dir = Path(raw_dir)
     errors: List[str] = []
     for patient_id in patient_ids:
-        paths = [_ct_path(raw_dir / str(patient_id), seq) for seq in sequences]
+        if path_map is None:
+            paths = [_ct_path(raw_dir / str(patient_id), seq) for seq in sequences]
+        else:
+            patient_paths = path_map.get(str(patient_id), {})
+            paths = [
+                patient_paths.get(
+                    seq, raw_dir / str(patient_id) / f"{seq}.nii.gz"
+                )
+                for seq in sequences
+            ]
         missing = [str(path) for path in paths if not path.exists()]
         if missing:
             errors.append(f"{patient_id}: missing {missing}")
@@ -60,9 +73,23 @@ def validate_patient_files(
         raise ValueError(f"CT cohort validation failed:\n{preview}")
 
 
-def create_split_manifest(cfg: Dict[str, Any], validate_images: bool = True) -> pd.DataFrame:
-    """Create and persist a stratified test holdout plus CV fold assignments."""
+def create_split_manifest(
+    cfg: Dict[str, Any], validate_images: bool = True
+) -> pd.DataFrame:
+    """Create patient-level development folds and a frozen test cohort."""
     data_cfg = cfg["data"]
+    if data_cfg.get("require_readiness_report", True):
+        report_path = Path(data_cfg["readiness_report"])
+        if not report_path.exists():
+            raise FileNotFoundError(
+                f"Readiness report not found: {report_path}. "
+                "Run scripts/audit_dataset.py first."
+            )
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if not report.get("ready_for_definitive_training", False):
+            raise ValueError(
+                "Dataset readiness report contains unresolved blockers."
+            )
     csv_path = Path(data_cfg["clinical_csv"])
     raw_dir = Path(data_cfg["raw_dir"])
     id_col = data_cfg["patient_id_column"]
@@ -71,6 +98,7 @@ def create_split_manifest(cfg: Dict[str, Any], validate_images: bool = True) -> 
     seed = int(data_cfg.get("random_seed", 42))
     n_splits = int(cv_cfg.get("n_splits", 5))
     test_size = float(cv_cfg.get("test_size", 0.15))
+    strategy = cv_cfg.get("strategy", "random_holdout")
 
     clinical = pd.read_csv(csv_path)
     if id_col not in clinical or label_col not in clinical:
@@ -85,32 +113,78 @@ def create_split_manifest(cfg: Dict[str, Any], validate_images: bool = True) -> 
         raise ValueError(f"'{label_col}' must contain only non-null binary labels.")
     clinical[label_col] = labels.astype(int)
 
+    use_manifest = bool(data_cfg.get("use_ct_manifest", True))
+    path_map = (
+        load_ct_path_map(data_cfg, clinical[id_col].tolist())
+        if use_manifest
+        else None
+    )
     available = sorted(
         patient_id
         for patient_id in clinical[id_col]
-        if (raw_dir / patient_id).is_dir()
+        if (
+            patient_id in path_map
+            if path_map is not None
+            else (raw_dir / patient_id).is_dir()
+        )
     )
     if len(available) != len(clinical):
         missing = sorted(set(clinical[id_col]) - set(available))
-        raise ValueError(f"Clinical patients without CT directories: {missing[:20]}")
+        raise ValueError(
+            f"Clinical patients without complete CT inputs: {missing[:20]}"
+        )
 
-    cohort = clinical.set_index(id_col).loc[available, [label_col]].reset_index()
+    cohort_columns = [label_col]
+    if strategy == "temporal_cohort":
+        cohort_column = cv_cfg.get("cohort_column", "cohort_period")
+        if cohort_column not in clinical:
+            raise ValueError(
+                f"Temporal splitting requires clinical column '{cohort_column}'."
+            )
+        cohort_columns.append(cohort_column)
+    cohort = clinical.set_index(id_col).loc[available, cohort_columns].reset_index()
     validate_patient_files(
         cohort[id_col],
         raw_dir,
         list(data_cfg["ct_sequences"]),
         check_geometry=validate_images,
+        path_map=path_map,
     )
 
     indices = np.arange(len(cohort))
     y = cohort[label_col].astype(int).to_numpy()
-    if test_size > 0:
+    if strategy == "temporal_cohort":
+        cohort_column = cv_cfg.get("cohort_column", "cohort_period")
+        values = cohort[cohort_column].astype(str).str.lower()
+        development_value = str(
+            cv_cfg.get("development_value", "retrospective")
+        ).lower()
+        test_value = str(cv_cfg.get("test_value", "prospective")).lower()
+        unknown = sorted(
+            set(values) - {development_value, test_value}
+        )
+        if unknown:
+            raise ValueError(
+                f"Unexpected values in '{cohort_column}': {unknown}"
+            )
+        cv_idx = indices[values.eq(development_value)]
+        test_idx = indices[values.eq(test_value)]
+        if len(cv_idx) == 0 or len(test_idx) == 0:
+            raise ValueError(
+                "Temporal splitting requires non-empty development and test cohorts."
+            )
+    elif strategy == "random_holdout" and test_size > 0:
         splitter = StratifiedShuffleSplit(
             n_splits=1, test_size=test_size, random_state=seed
         )
         cv_idx, test_idx = next(splitter.split(indices, y))
-    else:
+    elif strategy == "random_holdout":
         cv_idx, test_idx = indices, np.array([], dtype=int)
+    else:
+        raise ValueError(
+            "data.cross_validation.strategy must be temporal_cohort "
+            "or random_holdout."
+        )
 
     cv_labels = y[cv_idx]
     if np.min(np.bincount(cv_labels)) < n_splits:
@@ -136,7 +210,9 @@ def create_split_manifest(cfg: Dict[str, Any], validate_images: bool = True) -> 
 
     if (manifest.loc[manifest["split"] == "cv", "fold"] < 0).any():
         raise RuntimeError("Some cross-validation patients were not assigned a fold.")
-    if set(manifest.loc[manifest["split"] == "test", "label"]) != {0, 1}:
+    if len(test_idx) and set(
+        manifest.loc[manifest["split"] == "test", "label"]
+    ) != {0, 1}:
         raise ValueError("The test holdout must contain both outcome classes.")
 
     output = Path(data_cfg["manifest_path"])
@@ -156,7 +232,8 @@ def load_split_manifest(cfg: Dict[str, Any]) -> pd.DataFrame:
     manifest = pd.read_csv(path, dtype={"patient_id": str})
     required = {"patient_id", "label", "split", "fold"}
     if not required.issubset(manifest.columns):
-        raise ValueError(f"Manifest is missing columns: {sorted(required-set(manifest))}")
+        missing = sorted(required - set(manifest))
+        raise ValueError(f"Manifest is missing columns: {missing}")
     if manifest["patient_id"].duplicated().any():
         raise ValueError("Split manifest contains duplicate patient IDs.")
     if not set(manifest["split"]).issubset({"cv", "test"}):

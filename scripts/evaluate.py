@@ -25,6 +25,8 @@ from src.data.dataset import MRDMultimodalDataset
 from src.models.mrd_predictor import build_model
 from src.training.metrics import (
     bootstrap_confidence_intervals,
+    calibration_curve_data,
+    decision_curve_data,
     metrics_from_probabilities,
     select_operating_threshold,
 )
@@ -59,7 +61,9 @@ def _processor_path(checkpoint_path: Path, checkpoint: dict) -> Path:
     sibling = checkpoint_path.parent / "clinical_processor.pkl"
     if sibling.exists():
         return sibling
-    raise FileNotFoundError("Fitted clinical processor is missing from checkpoint artifacts.")
+    raise FileNotFoundError(
+        "Fitted clinical processor is missing from checkpoint artifacts."
+    )
 
 
 @torch.no_grad()
@@ -121,6 +125,36 @@ def _report(
         confidence_level=float(cfg["evaluation"].get("confidence_level", 0.95)),
         seed=int(cfg["data"].get("random_seed", 42)),
     )
+    calibration = calibration_curve_data(
+        targets,
+        probabilities,
+        n_bins=int(cfg["evaluation"].get("calibration_bins", 10)),
+    )
+    decision_curve = decision_curve_data(targets, probabilities)
+    subgroup_reports = {}
+    clinical_path = Path(cfg["data"]["clinical_csv"])
+    subgroup_columns = cfg["evaluation"].get("subgroups", [])
+    if clinical_path.exists() and subgroup_columns:
+        clinical = pd.read_csv(clinical_path, dtype={"patient_id": str})
+        available = [
+            column for column in subgroup_columns if column in clinical.columns
+        ]
+        enriched = predictions.merge(
+            clinical[["patient_id", *available]],
+            on="patient_id",
+            how="left",
+            validate="one_to_one",
+        )
+        for column in available:
+            subgroup_reports[column] = {}
+            for value, group in enriched.groupby(column, dropna=False):
+                if group["label"].nunique() < 2:
+                    continue
+                subgroup_reports[column][str(value)] = metrics_from_probabilities(
+                    group["label"].to_numpy(),
+                    group["probability"].to_numpy(),
+                    threshold,
+                )
     report = {
         "threshold": threshold,
         "metrics": metrics,
@@ -129,6 +163,9 @@ def _report(
             [metrics["fn"], metrics["tp"]],
         ],
         "confidence_intervals": intervals,
+        "calibration": calibration,
+        "decision_curve": decision_curve,
+        "subgroups": subgroup_reports,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     predictions.assign(
@@ -160,10 +197,25 @@ def aggregate_oof(checkpoint_dir: Path, output_dir: Path) -> float:
         oof["label"].to_numpy(),
         oof["probability"].to_numpy(),
         cfg["evaluation"].get("threshold_strategy", "youden"),
+        target_sensitivity=float(
+            cfg["evaluation"].get("target_sensitivity", 0.95)
+        ),
     )
     _report(oof, threshold, cfg, output_dir, "oof")
     with open(output_dir / "operating_threshold.json", "w", encoding="utf-8") as handle:
-        json.dump({"threshold": threshold, "strategy": "youden"}, handle, indent=2)
+        json.dump(
+            {
+                "threshold": threshold,
+                "strategy": cfg["evaluation"].get(
+                    "threshold_strategy", "youden"
+                ),
+                "target_sensitivity": cfg["evaluation"].get(
+                    "target_sensitivity"
+                ),
+            },
+            handle,
+            indent=2,
+        )
     return threshold
 
 
@@ -206,7 +258,9 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     if args.aggregate_oof or args.ensemble_test:
         if not args.checkpoint_dir:
-            raise ValueError("--checkpoint-dir is required for aggregate/ensemble modes.")
+            raise ValueError(
+                "--checkpoint-dir is required for aggregate/ensemble modes."
+            )
         checkpoint_dir = Path(args.checkpoint_dir)
         if args.aggregate_oof:
             aggregate_oof(checkpoint_dir, output_dir)

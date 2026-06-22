@@ -51,9 +51,21 @@ def test_synthetic_cpu_training_and_evaluation(tmp_path):
             "manifest_path": str(tmp_path / "splits.csv"),
             "num_workers": 0,
             "pin_memory": False,
+            "clinical_feature_columns": ["age", "sex"],
+            "clinical_feature_profiles": {
+                "clinical_pathology": ["age", "sex"],
+                "stage_only": ["age"],
+            },
+            "active_clinical_profile": "clinical_pathology",
+            "require_readiness_report": False,
+            "use_ct_manifest": False,
         }
     )
-    config["data"]["cross_validation"] = {"n_splits": 2, "test_size": 0.2}
+    config["data"]["cross_validation"] = {
+        "n_splits": 2,
+        "strategy": "random_holdout",
+        "test_size": 0.2,
+    }
     config["ct_preprocessing"].update(
         {"spatial_size": [16, 16, 16], "target_spacing": [1.0, 1.0, 1.0]}
     )
