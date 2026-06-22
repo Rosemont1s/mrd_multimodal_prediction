@@ -1,0 +1,94 @@
+# MRD multimodal prediction: canonical nested configuration
+data:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  clinical_csv: data/raw/clinical_data.csv
+  manifest_path: data/processed/splits.csv
+  patient_id_column: patient_id
+  label_column: mrd_status
+  ct_sequences: [sequence_1, sequence_2, sequence_3, sequence_4]
+  num_workers: 4
+  pin_memory: true
+  use_cache: false
+  cache_dir: data/processed/ct_cache
+  random_seed: 42
+  cross_validation:
+    n_splits: 5
+    test_size: 0.15
+
+ct_preprocessing:
+  spatial_size: [64, 128, 128]
+  target_spacing: [2.0, 1.0, 1.0]
+  intensity_min: -1024.0
+  intensity_max: 3071.0
+  normalize_mean: 0.5
+  normalize_std: 0.5
+
+model:
+  variant: gated_fusion  # gated_fusion, clinical_only, ct_only
+
+ct_extractor:
+  backbone: resnet18
+  pretrained: true
+  pretrained_weights_path: null
+  freeze: true
+  in_channels: 4
+  feature_dim: 512
+
+clinical_encoder:
+  # input_dim is derived from the fitted ClinicalProcessor.
+  hidden_dims: [128, 64]
+  output_dim: 128
+  dropout: 0.3
+
+fusion:
+  ct_feature_dim: 512
+  clinical_feature_dim: 128
+  projection_dim: 128
+  dropout: 0.2
+
+classifier:
+  input_dim: 128
+  hidden_dims: [64]
+  dropout: 0.3
+  num_classes: 1
+
+training:
+  batch_size: 4
+  num_epochs: 100
+  stage2_start_epoch: 15
+  optimizer: adamw
+  learning_rate: 1.0e-4
+  backbone_learning_rate: 1.0e-5
+  weight_decay: 1.0e-4
+  scheduler: cosine  # cosine, plateau, step, none
+  scheduler_params:
+    T_max: 100
+    eta_min: 1.0e-6
+  loss: auto_weighted_bce  # auto_weighted_bce, weighted_bce, focal, bce
+  pos_weight: 2.0
+  focal_alpha: 0.75
+  focal_gamma: 2.0
+  early_stopping_patience: 15
+  grad_clip_max_norm: 1.0
+
+evaluation:
+  metrics: [auroc, auprc, accuracy, sensitivity, specificity, f1]
+  threshold: 0.5
+  threshold_strategy: youden
+  bootstrap_samples: 1000
+  confidence_level: 0.95
+
+logging:
+  backend: tensorboard
+  log_dir: runs
+  wandb_project: mrd_prediction
+
+checkpoint:
+  save_dir: checkpoints
+  monitor_metric: val_auroc
+  monitor_mode: max
+
+device:
+  accelerator: auto
+  gpu_ids: [0]
