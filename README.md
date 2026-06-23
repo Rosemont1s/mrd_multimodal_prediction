@@ -59,7 +59,13 @@ The full linked-table contract is documented in
 ## Workflow
 
 ```bash
-pip install -r requirements.txt
+# Create and activate the reproducible Conda environment.
+conda env create -f environment.yml
+conda activate mrd-multimodal
+
+# Verify the interpreter and GPU-enabled PyTorch installation.
+python --version
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 
 # Create empty linked-table templates.
 python scripts/audit_dataset.py --init-templates data/raw/tables
@@ -88,12 +94,35 @@ python scripts/train.py --all-folds --variant ct_only
 python scripts/train.py --all-folds --variant gated_fusion \
   --clinical-profile clinical_pathology
 
+# Fusion ablation: unrestricted concatenation instead of convex gating.
+python scripts/train.py --all-folds --variant gated_fusion \
+  --clinical-profile clinical_pathology \
+  --override fusion.method=concat
+
+# Prespecified broad-window sensitivity analysis. Do not select the window
+# from prospective-cohort performance.
+python scripts/train.py --all-folds --variant ct_only \
+  --override ct_preprocessing.intensity_min=-1024 \
+             ct_preprocessing.intensity_max=3071
+
 # Pool OOF predictions, select a high-sensitivity triage threshold, and
 # apply it unchanged to the prospective temporal cohort.
 python scripts/evaluate.py \
   --checkpoint-dir experiments/gated_fusion_clinical_pathology \
   --aggregate-oof --ensemble-test
 ```
+
+After dependency changes, update the existing environment with:
+
+```bash
+conda env update -f environment.yml --prune
+```
+
+The environment uses Python 3.11 and installs the CUDA 12.6 PyTorch wheels
+inside the Conda environment. The NVIDIA driver supplies host-level GPU
+support; a separate system CUDA toolkit is not required for the prebuilt
+PyTorch binaries. CPU-only systems can remove the PyTorch CUDA index line from
+`environment.yml` before creating the environment.
 
 The audit refuses definitive training until:
 
@@ -114,6 +143,21 @@ eligible ∩ CT-complete ∩ pathology-complete ∩ valid first MRD
 Each fold stores its effective configuration, fitted clinical processor,
 best checkpoint, and OOF predictions. Evaluation reads these artifacts and
 never refits preprocessing on validation or test patients.
+
+The CT branch applies one shared single-channel MedicalNet ResNet-18 to each
+registered contrast phase and combines the resulting phase embeddings with
+learned attention. This preserves the input contract of the pretrained model;
+the phases are not averaged by a frozen multi-channel input convolution.
+Training first fits the phase-attention, fusion, and classifier layers, then
+unfreezes the final residual block and finally the complete fourth residual
+stage at a lower learning rate. Preprocessing canonicalizes orientation,
+crops the complete CT body foreground, and resizes the complete bounding box
+instead of applying an unverified fixed center crop.
+
+Before definitive training, visually audit transformed volumes and verify
+tumor coverage for every patient using lesion masks or documented lesion
+coordinates where available. Shape and affine agreement alone do not establish
+successful inter-phase registration.
 
 The default operating threshold targets 95% sensitivity on pooled out-of-fold
 predictions. Test-set reporting includes sensitivity, specificity, PPV, NPV,

@@ -39,3 +39,39 @@ class GatedFusion(nn.Module):
         clinical = self.clinical_projection(clinical_features)
         gate = torch.sigmoid(self.gate(torch.cat([ct, clinical], dim=-1)))
         return self.output_norm(gate * ct + (1.0 - gate) * clinical)
+
+
+class ConcatFusion(nn.Module):
+    """Concatenate projected modalities and learn unrestricted interactions."""
+
+    def __init__(
+        self,
+        ct_feature_dim: int = 512,
+        clinical_feature_dim: int = 128,
+        projection_dim: int = 128,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+        self.ct_projection = nn.Sequential(
+            nn.Linear(ct_feature_dim, projection_dim),
+            nn.LayerNorm(projection_dim),
+            nn.GELU(),
+        )
+        self.clinical_projection = nn.Sequential(
+            nn.Linear(clinical_feature_dim, projection_dim),
+            nn.LayerNorm(projection_dim),
+            nn.GELU(),
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(projection_dim * 2, projection_dim),
+            nn.LayerNorm(projection_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(
+        self, ct_features: torch.Tensor, clinical_features: torch.Tensor
+    ) -> torch.Tensor:
+        ct = self.ct_projection(ct_features)
+        clinical = self.clinical_projection(clinical_features)
+        return self.fusion(torch.cat([ct, clinical], dim=-1))

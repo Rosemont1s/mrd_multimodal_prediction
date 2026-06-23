@@ -5,6 +5,7 @@ import pytest
 import torch
 import yaml
 
+from scripts.train import build_optimizer
 from src.models.mrd_predictor import build_model
 
 
@@ -41,3 +42,83 @@ def test_clinical_only_state_dict_round_trip(config, tmp_path):
     restored.load_state_dict(torch.load(path, weights_only=True))
     for original, loaded in zip(model.parameters(), restored.parameters()):
         assert torch.equal(original, loaded)
+
+
+def test_ct_encoder_preserves_single_channel_pretrained_stem(config):
+    pytest.importorskip("monai")
+    cfg = copy.deepcopy(config)
+    cfg["model"]["variant"] = "ct_only"
+    model = build_model(cfg, clinical_input_dim=7)
+    assert model.ct_extractor.backbone.conv1.in_channels == 1
+
+    model.eval()
+    with torch.no_grad():
+        output = model(
+            torch.randn(1, 4, 16, 16, 16),
+            torch.empty(1, 0),
+        )
+    assert output["phase_attention"].shape == (1, 4)
+    assert torch.allclose(
+        output["phase_attention"].sum(dim=1),
+        torch.ones(1),
+        atol=1e-6,
+    )
+
+
+def test_phase_attention_is_optimized_during_frozen_backbone_stage(config):
+    pytest.importorskip("monai")
+    cfg = copy.deepcopy(config)
+    cfg["model"]["variant"] = "ct_only"
+    model = build_model(cfg, clinical_input_dim=7)
+    optimizer = build_optimizer(model, cfg)
+    optimized = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    assert id(model.ct_extractor.phase_embeddings) in optimized
+    assert all(
+        id(parameter) not in optimized
+        for parameter in model.ct_extractor.backbone.parameters()
+    )
+
+
+def test_ct_fine_tuning_unfreezes_gradually(config):
+    pytest.importorskip("monai")
+    cfg = copy.deepcopy(config)
+    cfg["model"]["variant"] = "ct_only"
+    model = build_model(cfg, clinical_input_dim=7)
+
+    initial = sum(
+        parameter.numel()
+        for parameter in model.ct_extractor.backbone.parameters()
+        if parameter.requires_grad
+    )
+    model.unfreeze_ct_last_block()
+    last_block = sum(
+        parameter.numel()
+        for parameter in model.ct_extractor.backbone.parameters()
+        if parameter.requires_grad
+    )
+    model.unfreeze_ct_layer4()
+    full_layer4 = sum(
+        parameter.numel()
+        for parameter in model.ct_extractor.backbone.parameters()
+        if parameter.requires_grad
+    )
+    assert initial == 0
+    assert 0 < last_block < full_layer4
+
+
+def test_concat_fusion_variant_runs(config):
+    pytest.importorskip("monai")
+    cfg = copy.deepcopy(config)
+    cfg["fusion"]["method"] = "concat"
+    model = build_model(cfg, clinical_input_dim=7)
+    model.eval()
+    with torch.no_grad():
+        output = model(
+            torch.randn(1, 4, 16, 16, 16),
+            torch.randn(1, 7),
+        )
+    assert output["logits"].shape == (1, 1)

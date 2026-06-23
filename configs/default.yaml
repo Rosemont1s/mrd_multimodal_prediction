@@ -121,10 +121,19 @@ data:
 ct_preprocessing:
   spatial_size: [64, 128, 128]
   target_spacing: [2.0, 1.0, 1.0]
-  intensity_min: -1024.0
-  intensity_max: 3071.0
+  # Soft-tissue window; compare against a broader prespecified window as an
+  # ablation rather than tuning it on the prospective cohort.
+  intensity_min: -200.0
+  intensity_max: 300.0
   normalize_mean: 0.5
   normalize_std: 0.5
+  orientation: RAS
+  crop_foreground: true
+  body_threshold_hu: -500.0
+  body_crop_margin: [8, 16, 16]
+  # "resize" retains the complete body box. "pad_crop" is permitted only
+  # after explicit lesion-coverage QC.
+  spatial_strategy: resize
 
 model:
   variant: gated_fusion  # gated_fusion, clinical_only, ct_only
@@ -136,6 +145,9 @@ ct_extractor:
   freeze: true
   in_channels: 4
   feature_dim: 512
+  phase_fusion: attention  # attention, mean
+  phase_attention_dim: 128
+  gradient_checkpointing: true
 
 clinical_encoder:
   # input_dim is derived from the fitted ClinicalProcessor.
@@ -144,6 +156,7 @@ clinical_encoder:
   dropout: 0.3
 
 fusion:
+  method: gated  # gated, concat
   ct_feature_dim: 512
   clinical_feature_dim: 128
   projection_dim: 128
@@ -156,9 +169,10 @@ classifier:
   num_classes: 1
 
 training:
-  batch_size: 4
+  batch_size: 2
   num_epochs: 100
-  stage2_start_epoch: 15
+  stage2_start_epoch: 10
+  stage3_start_epoch: 30
   optimizer: adamw
   learning_rate: 1.0e-4
   backbone_learning_rate: 1.0e-5
@@ -171,7 +185,7 @@ training:
   pos_weight: 2.0
   focal_alpha: 0.75
   focal_gamma: 2.0
-  early_stopping_patience: 15
+  early_stopping_patience: 20
   grad_clip_max_norm: 1.0
 
 evaluation:

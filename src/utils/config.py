@@ -204,13 +204,43 @@ def validate_config(cfg: Dict[str, Any]) -> None:
         raise ValueError(
             "ct_extractor.in_channels must equal the number of CT sequences."
         )
+    phase_fusion = cfg["ct_extractor"].get("phase_fusion", "attention")
+    if phase_fusion not in {"attention", "mean"}:
+        raise ValueError(
+            "ct_extractor.phase_fusion must be attention or mean."
+        )
+
+    preprocessing_cfg = cfg["ct_preprocessing"]
+    intensity_min = float(preprocessing_cfg.get("intensity_min", -200.0))
+    intensity_max = float(preprocessing_cfg.get("intensity_max", 300.0))
+    if intensity_min >= intensity_max:
+        raise ValueError(
+            "ct_preprocessing.intensity_min must be less than intensity_max."
+        )
+    spatial_strategy = preprocessing_cfg.get("spatial_strategy", "resize")
+    if spatial_strategy not in {"resize", "pad_crop"}:
+        raise ValueError(
+            "ct_preprocessing.spatial_strategy must be resize or pad_crop."
+        )
 
     projection_dim = int(cfg["fusion"].get("projection_dim", 128))
+    fusion_method = cfg["fusion"].get("method", "gated")
+    if fusion_method not in {"gated", "concat"}:
+        raise ValueError("fusion.method must be gated or concat.")
     classifier_dim = int(cfg["classifier"].get("input_dim", projection_dim))
     if classifier_dim != projection_dim:
         raise ValueError(
             "classifier.input_dim must equal fusion.projection_dim "
             f"({classifier_dim} != {projection_dim})."
+        )
+
+    train_cfg = cfg["training"]
+    stage2_epoch = int(train_cfg.get("stage2_start_epoch", 10))
+    stage3_epoch = int(train_cfg.get("stage3_start_epoch", 30))
+    if not 0 <= stage2_epoch < stage3_epoch:
+        raise ValueError(
+            "training stages must satisfy 0 <= stage2_start_epoch "
+            "< stage3_start_epoch."
         )
 
 

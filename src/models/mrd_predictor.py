@@ -10,7 +10,7 @@ import torch.nn as nn
 
 from src.models.clinical_encoder import ClinicalEncoder
 from src.models.ct_extractor import CTFeatureExtractor
-from src.models.fusion import GatedFusion
+from src.models.fusion import ConcatFusion, GatedFusion
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +88,14 @@ class MRDPredictor(nn.Module):
             )
 
         if self.variant == "gated_fusion":
-            self.fusion = GatedFusion(
+            fusion_method = cfg["fusion"].get("method", "gated")
+            fusion_classes = {
+                "gated": GatedFusion,
+                "concat": ConcatFusion,
+            }
+            if fusion_method not in fusion_classes:
+                raise ValueError(f"Unsupported fusion method: {fusion_method}")
+            self.fusion = fusion_classes[fusion_method](
                 ct_feature_dim=ct_cfg.get("feature_dim", 512),
                 clinical_feature_dim=clinical_cfg.get("output_dim", 128),
                 projection_dim=projection_dim,
@@ -119,16 +126,31 @@ class MRDPredictor(nn.Module):
     def forward(
         self, ct_images: torch.Tensor, clinical_features: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
+        phase_attention = None
         if self.variant == "gated_fusion":
-            ct = self.ct_extractor(ct_images)
+            ct, phase_attention = self.ct_extractor(
+                ct_images, return_attention=True
+            )
             clinical = self.clinical_encoder(clinical_features)
             fused = self.fusion(ct, clinical)
         elif self.variant == "ct_only":
-            fused = self.fusion(self.ct_extractor(ct_images))
+            ct, phase_attention = self.ct_extractor(
+                ct_images, return_attention=True
+            )
+            fused = self.fusion(ct)
         else:
             fused = self.fusion(self.clinical_encoder(clinical_features))
         logits = self.classifier(fused)
-        return {"logits": logits, "probs": torch.sigmoid(logits)}
+        output = {"logits": logits, "probs": torch.sigmoid(logits)}
+        if phase_attention is not None:
+            output["phase_attention"] = phase_attention
+        return output
+
+    def unfreeze_ct_last_block(self) -> bool:
+        if self.ct_extractor is None:
+            return False
+        self.ct_extractor.unfreeze_last_block()
+        return True
 
     def unfreeze_ct_layer4(self) -> bool:
         if self.ct_extractor is None:
@@ -141,13 +163,15 @@ class MRDPredictor(nn.Module):
             return []
         return (
             parameter
-            for parameter in self.ct_extractor.parameters()
+            for parameter in self.ct_extractor.backbone.parameters()
             if parameter.requires_grad
         )
 
     def non_backbone_parameters(self) -> Iterable[nn.Parameter]:
         for name, parameter in self.named_parameters():
-            if parameter.requires_grad and not name.startswith("ct_extractor."):
+            if parameter.requires_grad and not name.startswith(
+                "ct_extractor.backbone."
+            ):
                 yield parameter
 
     def get_trainable_params(self) -> List[nn.Parameter]:

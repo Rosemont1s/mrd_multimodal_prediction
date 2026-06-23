@@ -1,0 +1,14 @@
+name: mrd-multimodal
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - pip>=24
+  - setuptools
+  - wheel
+  - pip:
+      # PyTorch currently distributes supported Linux CUDA binaries via pip.
+      - --extra-index-url https://download.pytorch.org/whl/cu126
+      - -r requirements.txt

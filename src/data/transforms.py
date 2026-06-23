@@ -24,15 +24,18 @@ from typing import Any, Dict, Sequence
 
 from monai.transforms import (
     Compose,
+    CropForegroundd,
     EnsureChannelFirstd,
     LoadImaged,
     NormalizeIntensityd,
+    Orientationd,
     RandAdjustContrastd,
     RandFlipd,
     RandGaussianNoised,
     RandGaussianSmoothd,
     RandRotate90d,
     RandShiftIntensityd,
+    Resized,
     ResizeWithPadOrCropd,
     ScaleIntensityRanged,
     Spacingd,
@@ -44,14 +47,29 @@ from monai.transforms import (
 _DEFAULT_CFG: Dict[str, Any] = {
     "spatial_size": [64, 128, 128],
     "target_spacing": [2.0, 1.0, 1.0],
-    "intensity_min": -1024,
-    "intensity_max": 3071,
+    "intensity_min": -200,
+    "intensity_max": 300,
     "normalize_mean": 0.5,
     "normalize_std": 0.5,
+    "orientation": "RAS",
+    "crop_foreground": True,
+    "body_threshold_hu": -500,
+    "body_crop_margin": [8, 16, 16],
+    "spatial_strategy": "resize",
 }
 
 # Key used in MONAI dictionary transforms
 IMAGE_KEY = "image"
+
+
+class _ThresholdForeground:
+    """Pickle-safe CT body selector with an immutable HU threshold."""
+
+    def __init__(self, threshold_hu: float) -> None:
+        self.threshold_hu = threshold_hu
+
+    def __call__(self, x):
+        return x > self.threshold_hu
 
 
 def _resolve_cfg(cfg: Dict[str, Any] | None) -> Dict[str, Any]:
@@ -83,12 +101,14 @@ def _build_base_transforms(
     The pipeline order is:
     1. **LoadImaged** – read NIfTI from disk.
     2. **EnsureChannelFirstd** – guarantee shape ``(C, D, H, W)``.
-    3. **Spacingd** – resample to isotropic / target spacing.
-    4. **ScaleIntensityRanged** – clip HU values to ``[intensity_min,
+    3. **Orientationd** – canonicalize all patients to a common orientation.
+    4. **Spacingd** – resample to target spacing.
+    5. **CropForegroundd** – retain the complete body bounding box.
+    6. **ScaleIntensityRanged** – clip HU values to ``[intensity_min,
        intensity_max]`` and rescale to ``[0, 1]``.
-    5. **ResizeWithPadOrCropd** – deterministic centre crop or zero-pad to
-       ``spatial_size``.
-    6. **NormalizeIntensityd** – channel-wise z-score-style normalization
+    7. **Resized** – resize the complete body box to ``spatial_size`` by
+       default, avoiding an unverified center crop that can remove the lesion.
+    8. **NormalizeIntensityd** – fixed normalization
        ``(x - mean) / std`` using the configured mean and std.
 
     Parameters
@@ -107,19 +127,41 @@ def _build_base_transforms(
     intensity_max: float = cfg["intensity_max"]
     normalize_mean: float = cfg["normalize_mean"]
     normalize_std: float = cfg["normalize_std"]
+    spatial_strategy = cfg["spatial_strategy"]
+    if spatial_strategy not in {"resize", "pad_crop"}:
+        raise ValueError("spatial_strategy must be 'resize' or 'pad_crop'.")
 
-    return [
+    transforms = [
         # 1. Load NIfTI file from disk
         LoadImaged(keys=list(keys), image_only=True),
         # 2. Ensure channel-first layout (C, D, H, W)
         EnsureChannelFirstd(keys=list(keys)),
-        # 3. Resample to uniform voxel spacing
+        # 3. Canonicalize orientation across patients.
+        Orientationd(
+            keys=list(keys),
+            axcodes=cfg["orientation"],
+            labels=(("L", "R"), ("P", "A"), ("I", "S")),
+        ),
+        # 4. Resample to uniform voxel spacing
         Spacingd(
             keys=list(keys),
             pixdim=target_spacing,
             mode="bilinear",
         ),
-        # 4. Clip HU window and rescale to [0, 1]
+    ]
+    if cfg["crop_foreground"]:
+        transforms.append(
+            CropForegroundd(
+                keys=list(keys),
+                source_key=list(keys)[0],
+                select_fn=_ThresholdForeground(
+                    float(cfg["body_threshold_hu"])
+                ),
+                margin=cfg["body_crop_margin"],
+                allow_smaller=True,
+            )
+        )
+    transforms.append(
         ScaleIntensityRanged(
             keys=list(keys),
             a_min=intensity_min,
@@ -127,16 +169,31 @@ def _build_base_transforms(
             b_min=0.0,
             b_max=1.0,
             clip=True,
-        ),
-        # 5. Crop or pad to fixed spatial size
-        ResizeWithPadOrCropd(keys=list(keys), spatial_size=spatial_size),
-        # 6. Normalize: (x - mean) / std
+        )
+    )
+    if spatial_strategy == "resize":
+        transforms.append(
+            Resized(
+                keys=list(keys),
+                spatial_size=spatial_size,
+                mode="trilinear",
+                align_corners=False,
+            )
+        )
+    else:
+        transforms.append(
+            ResizeWithPadOrCropd(
+                keys=list(keys), spatial_size=spatial_size
+            )
+        )
+    transforms.append(
         NormalizeIntensityd(
             keys=list(keys),
             subtrahend=normalize_mean,
             divisor=normalize_std,
-        ),
-    ]
+        )
+    )
+    return transforms
 
 
 def get_train_transforms(

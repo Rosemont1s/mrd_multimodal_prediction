@@ -60,13 +60,15 @@ class Trainer:
 
         train_cfg = cfg["training"]
         self.num_epochs = int(train_cfg.get("num_epochs", 100))
-        self.stage2_start_epoch = int(train_cfg.get("stage2_start_epoch", 15))
+        self.stage2_start_epoch = int(train_cfg.get("stage2_start_epoch", 10))
+        self.stage3_start_epoch = int(train_cfg.get("stage3_start_epoch", 30))
         self.grad_clip_max_norm = float(train_cfg.get("grad_clip_max_norm", 0.0))
         self.patience = int(train_cfg.get("early_stopping_patience", 15))
         self.best_metric: Optional[float] = None
         self.epochs_without_improvement = 0
         self.start_epoch = 0
         self.stage2_active = False
+        self.stage3_active = False
 
         ckpt_cfg = cfg["checkpoint"]
         self.monitor_metric = ckpt_cfg.get("monitor_metric", "val_auroc")
@@ -136,17 +138,36 @@ class Trainer:
                 if not training:
                     probabilities = outputs["probs"].detach().cpu().reshape(-1)
                     true_labels = labels.detach().cpu().reshape(-1)
-                    records.extend(
-                        {
+                    phase_attention = outputs.get("phase_attention")
+                    if phase_attention is not None:
+                        phase_attention = phase_attention.detach().cpu()
+                    phase_names = self.cfg["data"].get("ct_sequences", [])
+                    for row_index, (
+                        patient_id,
+                        true_label,
+                        probability,
+                    ) in enumerate(
+                        zip(
+                            batch["patient_id"], true_labels, probabilities
+                        )
+                    ):
+                        record = {
                             "patient_id": str(patient_id),
                             "label": int(true_label),
                             "probability": float(probability),
                             "fold": int(self.split_metadata["fold"]),
                         }
-                        for patient_id, true_label, probability in zip(
-                            batch["patient_id"], true_labels, probabilities
-                        )
-                    )
+                        if phase_attention is not None:
+                            record.update(
+                                {
+                                    f"attention_{phase_name}": float(weight)
+                                    for phase_name, weight in zip(
+                                        phase_names,
+                                        phase_attention[row_index],
+                                    )
+                                }
+                            )
+                        records.append(record)
 
         metrics = meter.compute()
         metrics["loss"] = running_loss / max(len(loader), 1)
@@ -154,21 +175,51 @@ class Trainer:
             self.last_val_predictions = records
         return metrics
 
+    def _add_new_backbone_parameters(self, group_name: str) -> int:
+        existing = {
+            id(parameter)
+            for group in self.optimizer.param_groups
+            for parameter in group["params"]
+        }
+        new_parameters = [
+            parameter
+            for parameter in self.model.backbone_parameters()
+            if id(parameter) not in existing
+        ]
+        if not new_parameters:
+            return 0
+        backbone_lr = float(
+            self.cfg["training"].get("backbone_learning_rate", 1e-5)
+        )
+        self.optimizer.add_param_group(
+            {"params": new_parameters, "lr": backbone_lr, "name": group_name}
+        )
+        if self.scheduler is not None and hasattr(self.scheduler, "base_lrs"):
+            self.scheduler.base_lrs.append(backbone_lr)
+        return sum(parameter.numel() for parameter in new_parameters)
+
     def _activate_stage2(self) -> None:
-        if self.stage2_active or not self.model.unfreeze_ct_layer4():
+        if self.stage2_active or not self.model.unfreeze_ct_last_block():
             return
-        new_parameters = list(self.model.backbone_parameters())
-        if new_parameters:
-            backbone_lr = float(
-                self.cfg["training"].get("backbone_learning_rate", 1e-5)
-            )
-            self.optimizer.add_param_group(
-                {"params": new_parameters, "lr": backbone_lr, "name": "ct_layer4"}
-            )
-            if self.scheduler is not None and hasattr(self.scheduler, "base_lrs"):
-                self.scheduler.base_lrs.append(backbone_lr)
+        added = self._add_new_backbone_parameters("ct_layer4_last_block")
         self.stage2_active = True
-        logger.info("Stage 2 activated: CT layer4 unfrozen.")
+        self.epochs_without_improvement = 0
+        logger.info(
+            "Stage 2 activated: final CT residual block unfrozen (%d parameters).",
+            added,
+        )
+
+    def _activate_stage3(self) -> None:
+        if self.stage3_active or not self.model.unfreeze_ct_layer4():
+            return
+        added = self._add_new_backbone_parameters("ct_layer4_remaining")
+        self.stage2_active = True
+        self.stage3_active = True
+        self.epochs_without_improvement = 0
+        logger.info(
+            "Stage 3 activated: complete CT layer4 unfrozen (%d new parameters).",
+            added,
+        )
 
     def fit(self, resume_checkpoint: Optional[str] = None) -> Dict[str, Any]:
         if resume_checkpoint:
@@ -179,6 +230,8 @@ class Trainer:
         for epoch in range(self.start_epoch, self.num_epochs):
             if epoch >= self.stage2_start_epoch:
                 self._activate_stage2()
+            if epoch >= self.stage3_start_epoch:
+                self._activate_stage3()
             started = time.time()
             train_metrics = self._run_epoch(self.train_loader, training=True)
             val_metrics = self._run_epoch(self.val_loader, training=False)
@@ -261,6 +314,7 @@ class Trainer:
                 "threshold": self.threshold,
                 "best_metric": self.best_metric,
                 "stage2_active": self.stage2_active,
+                "stage3_active": self.stage3_active,
             },
             path,
         )
@@ -269,6 +323,8 @@ class Trainer:
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         if checkpoint.get("stage2_active"):
             self._activate_stage2()
+        if checkpoint.get("stage3_active"):
+            self._activate_stage3()
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if self.scheduler is not None and checkpoint.get("scheduler_state_dict"):

@@ -84,8 +84,10 @@ def predict_checkpoint(checkpoint_path: Path, split: str) -> pd.DataFrame:
     model = build_model(
         cfg, int(checkpoint["clinical_input_dim"]), load_pretrained=False
     )
-    if checkpoint.get("stage2_active"):
+    if checkpoint.get("stage3_active"):
         model.unfreeze_ct_layer4()
+    elif checkpoint.get("stage2_active"):
+        model.unfreeze_ct_last_block()
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device).eval()
 
@@ -97,17 +99,29 @@ def predict_checkpoint(checkpoint_path: Path, split: str) -> pd.DataFrame:
         )
         probabilities = outputs["probs"].cpu().reshape(-1).numpy()
         labels = batch["label"].reshape(-1).numpy()
-        records.extend(
-            {
+        phase_attention = outputs.get("phase_attention")
+        if phase_attention is not None:
+            phase_attention = phase_attention.cpu()
+        phase_names = cfg["data"].get("ct_sequences", [])
+        for row_index, (patient_id, label, probability) in enumerate(
+            zip(batch["patient_id"], labels, probabilities)
+        ):
+            record = {
                 "patient_id": str(patient_id),
                 "label": int(label),
                 "probability": float(probability),
                 "fold": int(checkpoint["split_metadata"]["fold"]),
             }
-            for patient_id, label, probability in zip(
-                batch["patient_id"], labels, probabilities
-            )
-        )
+            if phase_attention is not None:
+                record.update(
+                    {
+                        f"attention_{phase_name}": float(weight)
+                        for phase_name, weight in zip(
+                            phase_names, phase_attention[row_index]
+                        )
+                    }
+                )
+            records.append(record)
     return pd.DataFrame(records)
 
 
@@ -243,6 +257,19 @@ def ensemble_test(checkpoint_dir: Path, output_dir: Path) -> dict:
         probability_columns.append(aligned["probability"].to_numpy())
     ensemble = reference.copy()
     ensemble["probability"] = np.mean(probability_columns, axis=0)
+    attention_columns = [
+        column
+        for column in fold_predictions[0].columns
+        if column.startswith("attention_")
+    ]
+    for column in attention_columns:
+        ensemble[column] = np.mean(
+            [
+                predictions.sort_values("patient_id")[column].to_numpy()
+                for predictions in fold_predictions
+            ],
+            axis=0,
+        )
     threshold_file = output_dir / "operating_threshold.json"
     if threshold_file.exists():
         threshold = json.loads(threshold_file.read_text())["threshold"]
