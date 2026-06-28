@@ -23,3 +23,11 @@ wandb/
 *.dcm
 *.nii
 *.nii.gz
+
+# Local agent planning files
+AGENTS.md
+agents.md
+AGENT.md
+agent.md
+PLAN.md
+plan.md
