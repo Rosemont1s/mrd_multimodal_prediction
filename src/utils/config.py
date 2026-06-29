@@ -6,13 +6,16 @@ YAML configuration loading, deep-merging, and saving utilities.
 
 import copy
 import logging
-import os
+from collections.abc import Mapping, MutableMapping, Sequence
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import yaml
 
 logger = logging.getLogger(__name__)
 
+
+ConfigDict = Dict[str, Any]
 
 REQUIRED_SECTIONS = {
     "data",
@@ -27,8 +30,72 @@ REQUIRED_SECTIONS = {
     "device",
 }
 
+REQUIRED_DATA_KEYS = {
+    "raw_dir",
+    "clinical_csv",
+    "patient_id_column",
+    "label_column",
+}
+REQUIRED_COHORT_TABLES = {
+    "cohort",
+    "preoperative",
+    "pathology",
+    "mrd",
+    "ct_manifest",
+}
+REQUIRED_TEMPORAL_SPLIT_KEYS = {
+    "cohort_column",
+    "development_value",
+    "test_value",
+}
+REQUIRED_LAB_UNITS = {"cea", "ca199"}
 
-def load_config(config_path: str = "configs/default.yaml") -> Dict[str, Any]:
+VALID_SPLIT_STRATEGIES = {"random_holdout", "temporal_cohort"}
+VALID_THRESHOLD_STRATEGIES = {"youden", "target_sensitivity"}
+VALID_MODEL_VARIANTS = {"gated_fusion", "clinical_only", "ct_only"}
+VALID_PHASE_FUSIONS = {"attention", "mean"}
+VALID_SPATIAL_STRATEGIES = {"resize", "pad_crop"}
+VALID_FUSION_METHODS = {"gated", "concat"}
+TRUE_STRINGS = {"true", "yes"}
+FALSE_STRINGS = {"false", "no"}
+NONE_STRINGS = {"null", "none"}
+
+
+def _missing_keys(mapping: Mapping[str, Any], required: set[str]) -> list[str]:
+    """Return required keys absent from a mapping in deterministic order."""
+    return sorted(required - set(mapping))
+
+
+def _require_mapping(mapping: Mapping[str, Any], key: str, path: str) -> ConfigDict:
+    """Fetch a nested mapping and fail with a schema-oriented error."""
+    value = mapping.get(key)
+    if not isinstance(value, dict):
+        full_path = f"{path}.{key}" if path else key
+        raise ValueError(f"{full_path} must be a mapping.")
+    return value
+
+
+def _require_keys(
+    mapping: Mapping[str, Any],
+    required: set[str],
+    path: str,
+) -> None:
+    """Validate that a mapping contains all required schema keys."""
+    missing = _missing_keys(mapping, required)
+    if missing:
+        raise ValueError(f"Missing {path} configuration keys: {missing}")
+
+
+def _validate_string_list(value: Any, path: str) -> list[str]:
+    """Validate a non-empty list of string values and return it."""
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{path} must be a non-empty list.")
+    if any(not isinstance(item, str) or not item for item in value):
+        raise ValueError(f"{path} must contain non-empty strings.")
+    return value
+
+
+def load_config(config_path: str | Path = "configs/default.yaml") -> ConfigDict:
     """Load a YAML configuration file.
 
     Args:
@@ -40,39 +107,51 @@ def load_config(config_path: str = "configs/default.yaml") -> Dict[str, Any]:
     Raises:
         FileNotFoundError: If the config file does not exist.
     """
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+    path = Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Configuration file not found: {path}")
 
-    with open(config_path, "r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     if cfg is None:
         cfg = {}
 
     validate_config(cfg)
-    logger.info(f"Loaded configuration from: {config_path}")
+    logger.info("Loaded configuration from: %s", path)
     return cfg
 
 
-def validate_config(cfg: Dict[str, Any]) -> None:
+def validate_config(cfg: ConfigDict) -> None:
     """Validate the canonical nested configuration schema."""
-    missing = sorted(REQUIRED_SECTIONS - set(cfg))
+    if not isinstance(cfg, dict):
+        raise ValueError("Configuration must be a mapping.")
+
+    # Fail fast on structure before reading nested values; this makes CLI
+    # override mistakes much easier to diagnose.
+    missing = _missing_keys(cfg, REQUIRED_SECTIONS)
     if missing:
         raise ValueError(f"Missing configuration sections: {missing}")
+    for section in sorted(REQUIRED_SECTIONS):
+        _require_mapping(cfg, section, "")
 
     data_cfg = cfg["data"]
-    required_data = {"raw_dir", "clinical_csv", "patient_id_column", "label_column"}
-    missing_data = sorted(required_data - set(data_cfg))
-    if missing_data:
-        raise ValueError(f"Missing data configuration keys: {missing_data}")
+    _require_keys(data_cfg, REQUIRED_DATA_KEYS, "data")
 
     sequences = data_cfg.get("ct_sequences", [])
-    if not sequences or len(sequences) != len(set(sequences)):
+    if (
+        not isinstance(sequences, list)
+        or not sequences
+        or any(not isinstance(sequence, str) or not sequence for sequence in sequences)
+        or len(sequences) != len(set(sequences))
+    ):
         raise ValueError(
             "data.ct_sequences must contain one or more unique CT phase names."
         )
 
     cv_cfg = data_cfg.get("cross_validation", {})
+    if not isinstance(cv_cfg, dict):
+        raise ValueError("data.cross_validation must be a mapping.")
     n_splits = int(cv_cfg.get("n_splits", 5))
     test_size = float(cv_cfg.get("test_size", 0.15))
     split_strategy = cv_cfg.get("strategy", "random_holdout")
@@ -80,18 +159,15 @@ def validate_config(cfg: Dict[str, Any]) -> None:
         raise ValueError("data.cross_validation.n_splits must be at least 2.")
     if not 0.0 <= test_size < 1.0:
         raise ValueError("data.cross_validation.test_size must be in [0, 1).")
-    if split_strategy not in {"random_holdout", "temporal_cohort"}:
+    if split_strategy not in VALID_SPLIT_STRATEGIES:
         raise ValueError(
             "data.cross_validation.strategy must be random_holdout "
             "or temporal_cohort."
         )
     if split_strategy == "temporal_cohort":
-        required_temporal = {
-            "cohort_column",
-            "development_value",
-            "test_value",
-        }
-        missing_temporal = sorted(required_temporal - set(cv_cfg))
+        # Temporal holdout is the leakage-sensitive path: require explicit
+        # cohort labels rather than silently falling back to random splitting.
+        missing_temporal = _missing_keys(cv_cfg, REQUIRED_TEMPORAL_SPLIT_KEYS)
         if missing_temporal:
             raise ValueError(
                 "Temporal split configuration is missing: "
@@ -99,19 +175,16 @@ def validate_config(cfg: Dict[str, Any]) -> None:
             )
 
     cohort_tables = data_cfg.get("cohort_tables", {})
-    required_tables = {
-        "cohort",
-        "preoperative",
-        "pathology",
-        "mrd",
-        "ct_manifest",
-    }
-    missing_tables = sorted(required_tables - set(cohort_tables))
+    if not isinstance(cohort_tables, dict):
+        raise ValueError("data.cohort_tables must be a mapping.")
+    missing_tables = _missing_keys(cohort_tables, REQUIRED_COHORT_TABLES)
     if missing_tables:
         raise ValueError(
             f"data.cohort_tables is missing entries: {missing_tables}"
         )
     endpoint_cfg = data_cfg.get("mrd_endpoint", {})
+    if not isinstance(endpoint_cfg, dict):
+        raise ValueError("data.mrd_endpoint must be a mapping.")
     if "assay_definition_finalized" not in endpoint_cfg:
         raise ValueError(
             "data.mrd_endpoint.assay_definition_finalized is required."
@@ -130,18 +203,23 @@ def validate_config(cfg: Dict[str, Any]) -> None:
         if int(minimum) < 0 or int(maximum) < int(minimum):
             raise ValueError("Invalid MRD blood-draw window.")
     expected_units = data_cfg.get("expected_lab_units", {})
-    if not {"cea", "ca199"}.issubset(expected_units):
+    if (
+        not isinstance(expected_units, dict)
+        or not REQUIRED_LAB_UNITS.issubset(expected_units)
+    ):
         raise ValueError(
             "data.expected_lab_units must define CEA and CA19-9 units."
         )
 
     feature_columns = data_cfg.get("clinical_feature_columns")
+    feature_column_set = None
     if feature_columns is not None:
-        if not isinstance(feature_columns, list) or not feature_columns:
-            raise ValueError(
-                "data.clinical_feature_columns must be a non-empty list."
-            )
-        if len(feature_columns) != len(set(feature_columns)):
+        feature_columns = _validate_string_list(
+            feature_columns,
+            "data.clinical_feature_columns",
+        )
+        feature_column_set = set(feature_columns)
+        if len(feature_columns) != len(feature_column_set):
             raise ValueError("data.clinical_feature_columns contains duplicates.")
         protected = {
             data_cfg["patient_id_column"],
@@ -165,11 +243,20 @@ def validate_config(cfg: Dict[str, Any]) -> None:
             "data.clinical_feature_profiles must define named feature lists."
         )
     for name, columns in profiles.items():
-        if not isinstance(columns, list) or not columns:
+        columns = _validate_string_list(
+            columns,
+            f"Clinical feature profile '{name}'",
+        )
+        if len(columns) != len(set(columns)):
             raise ValueError(
-                f"Clinical feature profile '{name}' must be a non-empty list."
+                f"Clinical feature profile '{name}' contains duplicates."
             )
-        unknown = sorted(set(columns) - set(feature_columns or []))
+        # Profiles are checked against the master allowlist when one is
+        # configured. If no allowlist exists, downstream preprocessing still
+        # validates columns against the actual clinical table.
+        if feature_column_set is None:
+            continue
+        unknown = sorted(set(columns) - feature_column_set)
         if unknown:
             raise ValueError(
                 f"Clinical feature profile '{name}' contains unknown columns: "
@@ -183,7 +270,7 @@ def validate_config(cfg: Dict[str, Any]) -> None:
 
     evaluation_cfg = cfg["evaluation"]
     threshold_strategy = evaluation_cfg.get("threshold_strategy", "youden")
-    if threshold_strategy not in {"youden", "target_sensitivity"}:
+    if threshold_strategy not in VALID_THRESHOLD_STRATEGIES:
         raise ValueError(
             "evaluation.threshold_strategy must be youden or target_sensitivity."
         )
@@ -191,8 +278,11 @@ def validate_config(cfg: Dict[str, Any]) -> None:
     if not 0.0 < target_sensitivity <= 1.0:
         raise ValueError("evaluation.target_sensitivity must be in (0, 1].")
 
-    variant = cfg.get("model", {}).get("variant", "gated_fusion")
-    if variant not in {"gated_fusion", "clinical_only", "ct_only"}:
+    model_cfg = cfg.get("model", {})
+    if not isinstance(model_cfg, dict):
+        raise ValueError("model must be a mapping.")
+    variant = model_cfg.get("variant", "gated_fusion")
+    if variant not in VALID_MODEL_VARIANTS:
         raise ValueError(
             "model.variant must be gated_fusion, clinical_only, or ct_only."
         )
@@ -205,11 +295,13 @@ def validate_config(cfg: Dict[str, Any]) -> None:
             "ct_extractor.in_channels must equal the number of CT sequences."
         )
     phase_fusion = cfg["ct_extractor"].get("phase_fusion", "attention")
-    if phase_fusion not in {"attention", "mean"}:
+    if phase_fusion not in VALID_PHASE_FUSIONS:
         raise ValueError(
             "ct_extractor.phase_fusion must be attention or mean."
         )
 
+    # Keep CT preprocessing ranges explicit so comparable experiments cannot
+    # accidentally train with an inverted or unsupported spatial transform.
     preprocessing_cfg = cfg["ct_preprocessing"]
     intensity_min = float(preprocessing_cfg.get("intensity_min", -200.0))
     intensity_max = float(preprocessing_cfg.get("intensity_max", 300.0))
@@ -218,14 +310,15 @@ def validate_config(cfg: Dict[str, Any]) -> None:
             "ct_preprocessing.intensity_min must be less than intensity_max."
         )
     spatial_strategy = preprocessing_cfg.get("spatial_strategy", "resize")
-    if spatial_strategy not in {"resize", "pad_crop"}:
+    if spatial_strategy not in VALID_SPATIAL_STRATEGIES:
         raise ValueError(
             "ct_preprocessing.spatial_strategy must be resize or pad_crop."
         )
 
+    # Fusion and classifier dimensions must agree before the model is built.
     projection_dim = int(cfg["fusion"].get("projection_dim", 128))
     fusion_method = cfg["fusion"].get("method", "gated")
-    if fusion_method not in {"gated", "concat"}:
+    if fusion_method not in VALID_FUSION_METHODS:
         raise ValueError("fusion.method must be gated or concat.")
     classifier_dim = int(cfg["classifier"].get("input_dim", projection_dim))
     if classifier_dim != projection_dim:
@@ -245,9 +338,9 @@ def validate_config(cfg: Dict[str, Any]) -> None:
 
 
 def merge_configs(
-    base: Dict[str, Any],
-    override: Dict[str, Any],
-) -> Dict[str, Any]:
+    base: ConfigDict,
+    override: ConfigDict,
+) -> ConfigDict:
     """Recursively deep-merge two configuration dictionaries.
 
     Values from ``override`` take precedence over ``base``.  Nested
@@ -275,25 +368,26 @@ def merge_configs(
     return merged
 
 
-def save_config(cfg: Dict[str, Any], path: str) -> None:
+def save_config(cfg: Mapping[str, Any], path: str | Path) -> None:
     """Save a configuration dictionary to a YAML file.
 
     Args:
         cfg: Configuration dictionary to save.
         path: Output file path.
     """
-    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+    with output_path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
 
-    logger.info(f"Saved configuration to: {path}")
+    logger.info("Saved configuration to: %s", output_path)
 
 
 def apply_overrides(
-    cfg: Dict[str, Any],
-    overrides: Optional[list] = None,
-) -> Dict[str, Any]:
+    cfg: ConfigDict,
+    overrides: Optional[Sequence[str]] = None,
+) -> ConfigDict:
     """Apply command-line key=value overrides to a configuration dict.
 
     Supports dotted keys for nested access, e.g.,
@@ -314,22 +408,33 @@ def apply_overrides(
 
     for override in overrides:
         if "=" not in override:
-            logger.warning(f"Skipping malformed override (no '='): {override}")
+            logger.warning("Skipping malformed override (no '='): %s", override)
             continue
 
         key_path, value_str = override.split("=", 1)
-        keys = key_path.strip().split(".")
+        key_path = key_path.strip()
+        keys = [key.strip() for key in key_path.split(".")]
+        if not key_path or any(not key for key in keys):
+            logger.warning("Skipping malformed override (empty key): %s", override)
+            continue
         value = _auto_cast(value_str.strip())
 
-        # Navigate to the nested dict
-        d = cfg
-        for k in keys[:-1]:
-            if k not in d or not isinstance(d[k], dict):
-                d[k] = {}
-            d = d[k]
+        # Create intermediate sections as needed for dotted CLI overrides.
+        current: MutableMapping[str, Any] = cfg
+        for key in keys[:-1]:
+            child = current.get(key)
+            if not isinstance(child, MutableMapping):
+                child = {}
+                current[key] = child
+            current = child
 
-        d[keys[-1]] = value
-        logger.info(f"Override applied: {key_path} = {value} ({type(value).__name__})")
+        current[keys[-1]] = value
+        logger.info(
+            "Override applied: %s = %r (%s)",
+            key_path,
+            value,
+            type(value).__name__,
+        )
 
     return cfg
 
@@ -339,23 +444,23 @@ def _auto_cast(value: str) -> Any:
 
     Tries in order: ``bool``, ``int``, ``float``, then falls back to ``str``.
     """
-    # Boolean
-    if value.lower() in ("true", "yes"):
+    normalized = value.lower()
+
+    # Keep an explicit empty override as an empty string rather than YAML null.
+    if value == "":
+        return value
+    if normalized in TRUE_STRINGS:
         return True
-    if value.lower() in ("false", "no"):
+    if normalized in FALSE_STRINGS:
         return False
-    # None
-    if value.lower() in ("null", "none"):
+    if normalized in NONE_STRINGS:
         return None
-    # Integer
     try:
         return int(value)
     except ValueError:
         pass
-    # Float
     try:
         return float(value)
     except ValueError:
         pass
-    # String
     return value
